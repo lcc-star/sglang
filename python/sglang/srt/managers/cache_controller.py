@@ -53,11 +53,20 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def _new_timing_event():
+    """Create an event suitable for elapsed_time on CUDA-like backends."""
+    try:
+        return device_module.Event(enable_timing=True)
+    except TypeError:
+        return device_module.Event()
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
         self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        self.load_events[-1] = _new_timing_event()
+        self.start_event = _new_timing_event()  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -688,8 +697,8 @@ class HiCacheController:
             )
         self.write_queue.clear()
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        start_event = _new_timing_event()
+        finish_event = _new_timing_event()
 
         start_event.record()
         with device_module.stream(self.write_stream):

@@ -223,6 +223,7 @@ class HiRadixCache(RadixCache):
             and not server_args.disable_qos_hicache_auto_calibrate
         )
         self.qos_hicache_recompute_calibration_samples = 0
+        self.qos_hicache_recompute_calibration_min_tokens = 256
         self.qos_hicache_max_eviction_steps = (
             server_args.qos_hicache_max_eviction_steps
         )
@@ -307,7 +308,7 @@ class HiRadixCache(RadixCache):
         if (
             not self._qos_exclusive_hicache_enabled()
             or not self.qos_hicache_auto_calibrate
-            or num_tokens <= 0
+            or num_tokens < self.qos_hicache_recompute_calibration_min_tokens
             or duration <= 0
             or self.qos_hicache_recompute_calibration_samples >= 3
         ):

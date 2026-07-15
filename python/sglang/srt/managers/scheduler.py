@@ -3225,8 +3225,10 @@ class Scheduler(
                 for req in batch.reqs
                 if req.extend_range is not None
             )
-            if num_tokens > 0:
-                start_event = self.device_module.Event()
+            if num_tokens >= getattr(
+                self.tree_cache, "qos_hicache_recompute_calibration_min_tokens", 256
+            ):
+                start_event = self.device_module.Event(enable_timing=True)
                 start_event.record()
                 qos_calibration = (num_tokens, start_event)
         self.forward_ct += 1
@@ -3420,7 +3422,7 @@ class Scheduler(
         self._maybe_report_active_ranks()
 
         if qos_calibration is not None:
-            finish_event = self.device_module.Event()
+            finish_event = self.device_module.Event(enable_timing=True)
             finish_event.record()
             finish_event.synchronize()
             num_tokens, start_event = qos_calibration
