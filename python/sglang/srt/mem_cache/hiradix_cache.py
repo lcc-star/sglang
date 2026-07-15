@@ -218,6 +218,7 @@ class HiRadixCache(RadixCache):
         )
         self.qos_hicache_cost_ewma_alpha = 0.2
         self.ongoing_load_back_stats = {}
+        self.pending_host_source_releases = set()
         self.load_back_threshold = 10
 
         # Detach storage backend automatically on process shutdown
@@ -643,6 +644,7 @@ class HiRadixCache(RadixCache):
         _drain_revoke()
         _drain_backup()
         _drain_release()
+        self._release_pending_host_copies()
 
     def _parse_storage_backend_extra_config(
         self, storage_backend_extra_config: Optional[str]
@@ -743,6 +745,7 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.ongoing_load_back_stats.clear()
+        self.pending_host_source_releases.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -839,8 +842,16 @@ class HiRadixCache(RadixCache):
 
         return len(host_indices)
 
+    def _qos_exclusive_hicache_enabled(self) -> bool:
+        return (
+            self.enable_qos_aware_prefix_cache
+            and self.cache_controller.write_policy == "write_back"
+        )
+
     def _prepare_selective_host_space(self, node: TreeNode) -> bool:
-        """Admit only if Host has room or colder replaceable data can be removed."""
+        """Demote only if reused and colder Host data can make room."""
+        if node.hit_count < self.write_through_threshold:
+            return False
         candidate_priority = self._get_host_admission_priority(node)
         if candidate_priority[0] <= 0:
             return False
@@ -909,6 +920,27 @@ class HiRadixCache(RadixCache):
                     (1 - alpha) * node.host_transfer_time_per_token
                     + alpha * observed
                 )
+
+    def _drop_host_copy(self, node: TreeNode) -> None:
+        if node.host_value is None:
+            self.pending_host_source_releases.discard(node)
+            return
+        if node.host_ref_counter > 0:
+            self.pending_host_source_releases.add(node)
+            return
+        self.pending_host_source_releases.discard(node)
+        self._record_remove_event(node, medium=StorageMedium.CPU)
+        self.cache_controller.evict_host(node.host_value)
+        node.host_value = None
+        self._update_host_leaf_status(node)
+        self._update_host_leaf_status(node.parent)
+
+    def _release_pending_host_copies(self) -> None:
+        for node in list(self.pending_host_source_releases):
+            if node.evicted or node.host_value is None:
+                self.pending_host_source_releases.discard(node)
+            elif node.host_ref_counter == 0:
+                self._drop_host_copy(node)
 
     def _track_write_through_node(self, node: TreeNode, backup_len: int) -> None:
         node.write_through_pending_id = node.id
@@ -1017,21 +1049,16 @@ class HiRadixCache(RadixCache):
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
-        if self.cache_controller.write_policy == "write_back" or chunked:
+        if chunked:
             return
-        node.hit_count += 1
+        if self.cache_controller.write_policy == "write_back":
+            if self._qos_exclusive_hicache_enabled():
+                node.hit_count += 1
+            return
 
+        node.hit_count += 1
         if not node.backuped and node.hit_count >= self.write_through_threshold:
-            # The frequency threshold is the first admission filter. Under the
-            # QoS feature gate, the dynamic Host-score comparison is the second.
-            self.write_backup(
-                node,
-                selective_admission=(
-                    self.enable_qos_aware_prefix_cache
-                    and self.cache_controller.write_policy
-                    == "write_through_selective"
-                ),
-            )
+            self.write_backup(node)
 
     def writing_check(self, write_back=False):
         if write_back:
@@ -1102,6 +1129,8 @@ class HiRadixCache(RadixCache):
                     loaded_tokens,
                     start_event.elapsed_time(finish_event) / 1000.0,
                 )
+                for node in loaded_nodes:
+                    self._drop_host_copy(node)
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
@@ -1239,7 +1268,11 @@ class HiRadixCache(RadixCache):
                 continue
             if x.backuped:
                 num_evicted += self._evict_backuped(x)
-            elif self.write_backup(x, write_back=True) > 0:
+            elif self.write_backup(
+                x,
+                write_back=True,
+                selective_admission=self._qos_exclusive_hicache_enabled(),
+            ) > 0:
                 x.protect_host()
                 staged.append((x, x.value))
                 num_evicted += self._detach_backuped(x)
@@ -1388,7 +1421,7 @@ class HiRadixCache(RadixCache):
             self.dec_lock_ref(ancester_node)
             return None
         if (
-            self.enable_qos_aware_prefix_cache
+            self._qos_exclusive_hicache_enabled()
             and not self._should_load_back(nodes_to_load)
         ):
             self.dec_lock_ref(ancester_node)
@@ -1427,7 +1460,7 @@ class HiRadixCache(RadixCache):
         for n in nodes_to_load:
             n.release_host()
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
-        if self.enable_qos_aware_prefix_cache:
+        if self._qos_exclusive_hicache_enabled():
             self.ongoing_load_back_stats[last_hit_node.id] = (
                 nodes_to_load, len(device_indices)
             )
@@ -1836,14 +1869,18 @@ class HiRadixCache(RadixCache):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:
                     value.append(new_node.value)
-                elif update_cache_stats:
+                elif (
+                    update_cache_stats and self._qos_exclusive_hicache_enabled()
+                ):
                     new_node.host_match_count += 1
                 node = new_node
                 break
             else:
                 if not child.evicted:
                     value.append(child.value)
-                elif update_cache_stats:
+                elif (
+                    update_cache_stats and self._qos_exclusive_hicache_enabled()
+                ):
                     child.host_match_count += 1
                 node = child
                 key = key[prefix_len:]
@@ -1922,6 +1959,8 @@ class HiRadixCache(RadixCache):
                     # this often happens in the case of KV cache recomputation
                     node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(node.value)
+                    if self._qos_exclusive_hicache_enabled():
+                        self._drop_host_copy(node)
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)
                     # update parent status as a new leaf is added into device
@@ -1937,6 +1976,8 @@ class HiRadixCache(RadixCache):
                 if new_node.evicted:
                     new_node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(new_node.value)
+                    if self._qos_exclusive_hicache_enabled():
+                        self._drop_host_copy(new_node)
                     self._update_leaf_status(new_node)
                     self._update_host_leaf_status(new_node)
                     # update parent status as a new leaf is added into device
@@ -1969,7 +2010,10 @@ class HiRadixCache(RadixCache):
             # Emit BlockStored so the router indexes this block.
             self._record_store_event(new_node)
 
-            if self.cache_controller.write_policy != "write_back":
+            if (
+                self.cache_controller.write_policy != "write_back"
+                or self._qos_exclusive_hicache_enabled()
+            ):
                 self._inc_hit_count(new_node, chunked)
         return InsertResult(prefix_len=total_prefix_length)
 
