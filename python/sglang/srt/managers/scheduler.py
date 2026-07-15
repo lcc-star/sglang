@@ -489,6 +489,8 @@ class Scheduler(
             enable_hierarchical_cache=self.enable_hierarchical_cache,
             page_size=self.page_size,
         )
+        if hasattr(self.tree_cache, "calibrate_transfer_cost"):
+            self.tree_cache.calibrate_transfer_cost()
 
         # Init running status
         self.init_running_status()
@@ -3207,6 +3209,26 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        qos_calibration = None
+        if (
+            batch.forward_mode.is_extend()
+            and hasattr(self.tree_cache, "record_recompute_calibration")
+            and getattr(self.tree_cache, "enable_qos_aware_prefix_cache", False)
+            and getattr(self.tree_cache, "qos_hicache_auto_calibrate", False)
+            and self.tree_cache.cache_controller.write_policy == "write_back"
+            and getattr(
+                self.tree_cache, "qos_hicache_recompute_calibration_samples", 3
+            ) < 3
+        ):
+            num_tokens = sum(
+                req.extend_range.length
+                for req in batch.reqs
+                if req.extend_range is not None
+            )
+            if num_tokens > 0:
+                start_event = self.device_module.Event()
+                start_event.record()
+                qos_calibration = (num_tokens, start_event)
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
@@ -3396,6 +3418,15 @@ class Scheduler(
                 )
 
         self._maybe_report_active_ranks()
+
+        if qos_calibration is not None:
+            finish_event = self.device_module.Event()
+            finish_event.record()
+            finish_event.synchronize()
+            num_tokens, start_event = qos_calibration
+            self.tree_cache.record_recompute_calibration(
+                num_tokens, start_event.elapsed_time(finish_event) / 1000.0
+            )
 
         return ret
 

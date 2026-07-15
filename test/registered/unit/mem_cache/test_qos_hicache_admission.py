@@ -23,7 +23,10 @@ class TestQoSHiCacheAdmission(unittest.TestCase):
         cache.schedule_low_priority_values_first = False
         cache.qos_hicache_recompute_time_per_token = 0.1
         cache.qos_hicache_transfer_time_per_token = 0.05
+        cache.qos_hicache_write_time_per_token = 0.0
         cache.qos_hicache_cost_ewma_alpha = 0.2
+        cache.qos_hicache_auto_calibrate = True
+        cache.qos_hicache_recompute_calibration_samples = 0
         cache.qos_hicache_max_eviction_steps = 64
         cache.ongoing_load_back_stats = {}
         cache.pending_host_source_releases = set()
@@ -241,6 +244,17 @@ class TestQoSHiCacheAdmission(unittest.TestCase):
         self.assertEqual(node.host_load_count, 1)
         self.assertAlmostEqual(node.host_transfer_time_per_token, 0.1)
         self.assertAlmostEqual(cache.qos_hicache_transfer_time_per_token, 0.06)
+
+    def test_recompute_calibration_averages_first_three_real_prefills(self):
+        cache = self._cache()
+
+        cache.record_recompute_calibration(10, 0.5)
+        cache.record_recompute_calibration(10, 1.0)
+        cache.record_recompute_calibration(10, 1.5)
+        cache.record_recompute_calibration(10, 10.0)
+
+        self.assertEqual(cache.qos_hicache_recompute_calibration_samples, 3)
+        self.assertAlmostEqual(cache.qos_hicache_recompute_time_per_token, 0.1)
 
     def test_host_logical_match_counts_without_load_back(self):
         cache = self._cache()

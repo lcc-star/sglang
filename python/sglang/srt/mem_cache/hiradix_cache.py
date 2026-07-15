@@ -216,7 +216,10 @@ class HiRadixCache(RadixCache):
         self.qos_hicache_transfer_time_per_token = (
             self.qos_hicache_recompute_time_per_token / 2
         )
+        self.qos_hicache_write_time_per_token = 0.0
         self.qos_hicache_cost_ewma_alpha = 0.2
+        self.qos_hicache_auto_calibrate = server_args.qos_hicache_auto_calibrate
+        self.qos_hicache_recompute_calibration_samples = 0
         self.qos_hicache_max_eviction_steps = (
             server_args.qos_hicache_max_eviction_steps
         )
@@ -230,6 +233,94 @@ class HiRadixCache(RadixCache):
         self.evictable_host_leaves = set()
 
         super().__init__(params=params)
+
+    def calibrate_transfer_cost(self, sample_tokens: int = 256) -> None:
+        """Measure the real HiCache H2D path without changing the radix tree."""
+        if (
+            not self._qos_exclusive_hicache_enabled()
+            or not self.qos_hicache_auto_calibrate
+        ):
+            return
+        controller = self.cache_controller
+        sample_tokens = min(
+            sample_tokens,
+            controller.mem_pool_device_allocator.available_size() // 2,
+            controller.mem_pool_host.available_size(),
+        )
+        sample_tokens -= sample_tokens % self.page_size
+        if sample_tokens <= 0:
+            logger.warning("QoS HiCache transfer calibration skipped: no free cache pages")
+            return
+        device_indices = host_indices = loaded_indices = None
+        try:
+            device_indices = controller.mem_pool_device_allocator.alloc(sample_tokens)
+            if device_indices is None:
+                raise RuntimeError("cannot allocate calibration device slots")
+            host_indices = controller.write(device_indices, node_id=-1)
+            if host_indices is None:
+                raise RuntimeError("cannot allocate calibration host slots")
+            write_ack = controller.ack_write_queue.pop()
+            write_ack.finish_event.synchronize()
+            write_duration = (
+                write_ack.start_event.elapsed_time(write_ack.finish_event) / 1000.0
+            )
+
+            loaded_indices = controller.load(host_indices, node_id=-1)
+            if loaded_indices is None:
+                raise RuntimeError("cannot allocate calibration load slots")
+            controller.start_loading()
+            load_ack = controller.ack_load_queue.pop()
+            load_ack.finish_event.synchronize()
+            duration = load_ack.start_event.elapsed_time(load_ack.finish_event) / 1000.0
+            costs = torch.tensor(
+                [duration / sample_tokens, write_duration / sample_tokens],
+                dtype=torch.float64,
+                device="cpu",
+            )
+            self._all_reduce(costs, torch.distributed.ReduceOp.MAX)
+            self.qos_hicache_transfer_time_per_token = float(costs[0].item())
+            self.qos_hicache_write_time_per_token = float(costs[1].item())
+            logger.info(
+                "QoS HiCache calibrated transfer cost: H2D %.3f us/token, "
+                "D2H %.3f us/token (%d tokens)",
+                self.qos_hicache_transfer_time_per_token * 1e6,
+                self.qos_hicache_write_time_per_token * 1e6,
+                sample_tokens,
+            )
+        except Exception:
+            logger.exception(
+                "QoS HiCache transfer calibration failed; using configured fallback"
+            )
+        finally:
+            if loaded_indices is not None:
+                controller.mem_pool_device_allocator.free(loaded_indices)
+            if host_indices is not None:
+                controller.mem_pool_host.free(host_indices)
+            if device_indices is not None:
+                controller.mem_pool_device_allocator.free(device_indices)
+
+    def record_recompute_calibration(self, num_tokens: int, duration: float) -> None:
+        """Update recomputation cost from the first real prefill batches."""
+        if (
+            not self._qos_exclusive_hicache_enabled()
+            or not self.qos_hicache_auto_calibrate
+            or num_tokens <= 0
+            or duration <= 0
+            or self.qos_hicache_recompute_calibration_samples >= 3
+        ):
+            return
+        observed = duration / num_tokens
+        alpha = 1.0 / (self.qos_hicache_recompute_calibration_samples + 1)
+        self.qos_hicache_recompute_time_per_token = (
+            (1 - alpha) * self.qos_hicache_recompute_time_per_token
+            + alpha * observed
+        )
+        self.qos_hicache_recompute_calibration_samples += 1
+        logger.info(
+            "QoS HiCache calibrated recompute cost: %.3f us/token (sample %d/3)",
+            self.qos_hicache_recompute_time_per_token * 1e6,
+            self.qos_hicache_recompute_calibration_samples,
+        )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -878,7 +969,10 @@ class HiRadixCache(RadixCache):
             else self.qos_hicache_transfer_time_per_token
         )
         net_benefit = max(
-            self.qos_hicache_recompute_time_per_token - transfer_time, 0.0
+            self.qos_hicache_recompute_time_per_token
+            - transfer_time
+            - self.qos_hicache_write_time_per_token,
+            0.0,
         )
         demand = node.hit_count + node.host_match_count
         qos_weight = get_qos_weight(

@@ -727,6 +727,10 @@ class ServerArgs:
         float,
         "Estimated prefill recomputation time per token in seconds for QoS-aware HiCache admission.",
     ] = 1e-4
+    qos_hicache_auto_calibrate: A[
+        bool,
+        "Calibrate QoS-aware HiCache transfer costs at startup and recomputation costs from initial real prefill batches.",
+    ] = True
     qos_hicache_max_eviction_steps: A[
         int,
         "Maximum victim-selection steps per QoS-aware HiCache eviction operation.",
