@@ -217,6 +217,9 @@ class HiRadixCache(RadixCache):
             self.qos_hicache_recompute_time_per_token / 2
         )
         self.qos_hicache_cost_ewma_alpha = 0.2
+        self.qos_hicache_max_eviction_steps = (
+            server_args.qos_hicache_max_eviction_steps
+        )
         self.ongoing_load_back_stats = {}
         self.pending_host_source_releases = set()
         self.load_back_threshold = 10
@@ -1351,44 +1354,96 @@ class HiRadixCache(RadixCache):
         self._update_host_leaf_status(root.parent)
         return freed_device
 
+    def _select_host_victims(
+        self, num_tokens: int, max_priority, priority_fn
+    ) -> list[TreeNode]:
+        heap = [
+            (priority_fn(node), node) for node in self.evictable_host_leaves
+        ]
+        heapq.heapify(heap)
+        remaining_children = {}
+        victims = []
+        selected = set()
+        selected_tokens = 0
+        steps = 0
+
+        while (
+            selected_tokens < num_tokens
+            and heap
+            and steps < self.qos_hicache_max_eviction_steps
+        ):
+            priority, node = heapq.heappop(heap)
+            steps += 1
+            if priority >= max_priority:
+                break
+            if (
+                node is self.root_node
+                or not node.evicted
+                or not node.backuped
+                or node.host_ref_counter > 0
+                or node in selected
+            ):
+                continue
+
+            victims.append(node)
+            selected.add(node)
+            selected_tokens += len(node.host_value)
+            parent = node.parent
+            if parent is self.root_node:
+                continue
+            remaining = remaining_children.get(parent, len(parent.children)) - 1
+            remaining_children[parent] = remaining
+            if (
+                remaining == 0
+                and parent.evicted
+                and parent.backuped
+                and parent.host_ref_counter == 0
+            ):
+                heapq.heappush(heap, (priority_fn(parent), parent))
+
+        return victims if selected_tokens >= num_tokens else []
+
+    def _evict_host_node(self, node: TreeNode) -> int:
+        self._record_remove_event(node, medium=StorageMedium.CPU)
+        num_evicted = self.cache_controller.evict_host(node.host_value)
+        key = node.key.child_key(self.page_size)
+        removed = node.parent.children.pop(key, None)
+        assert removed == node, f"parent does not have child key, {key}"
+        self.evictable_host_leaves.discard(node)
+        self._update_host_leaf_status(node.parent)
+        return num_evicted
+
     def evict_host(
         self, num_tokens: int, max_priority=None, priority_fn=None
     ) -> int:
-        leaves = list(self.evictable_host_leaves)
         if priority_fn is None:
             priority_fn = self.eviction_strategy.get_priority
+
+        if max_priority is not None:
+            victims = self._select_host_victims(
+                num_tokens, max_priority, priority_fn
+            )
+            if not victims:
+                return 0
+            return sum(self._evict_host_node(node) for node in victims)
+
+        leaves = list(self.evictable_host_leaves)
         eviction_heap = [(priority_fn(node), node) for node in leaves]
         heapq.heapify(eviction_heap)
-
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
-            priority, x = heapq.heappop(eviction_heap)
-            if max_priority is not None and priority >= max_priority:
+            _, node = heapq.heappop(eviction_heap)
+            if node == self.root_node:
                 break
-            if x == self.root_node:
-                break
-            # only evict the host value of evicted nodes
-            if not x.evicted:
+            if not node.evicted or node.host_ref_counter > 0:
                 continue
 
-            if x.host_ref_counter > 0:
-                continue
-
-            # Block deleted entirely (GPU already evicted, now CPU freed) --
-            # emit remove(CPU) so the router drops the host-tier entry.
-            self._record_remove_event(x, medium=StorageMedium.CPU)
-            num_evicted += self.cache_controller.evict_host(x.host_value)
-
-            key = x.key.child_key(self.page_size)
-            v = x.parent.children.pop(key, None)
-            assert v == x, f"parent does not have child key, {key}"
-            if x in self.evictable_host_leaves:
-                self.evictable_host_leaves.remove(x)
-            self._update_host_leaf_status(x.parent)
-
-            if len(x.parent.children) == 0 and x.parent.evicted:
-                new_priority = priority_fn(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+            parent = node.parent
+            num_evicted += self._evict_host_node(node)
+            if len(parent.children) == 0 and parent.evicted:
+                heapq.heappush(
+                    eviction_heap, (priority_fn(parent), parent)
+                )
 
         return num_evicted
 

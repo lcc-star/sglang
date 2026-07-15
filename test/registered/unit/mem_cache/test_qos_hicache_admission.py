@@ -24,6 +24,7 @@ class TestQoSHiCacheAdmission(unittest.TestCase):
         cache.qos_hicache_recompute_time_per_token = 0.1
         cache.qos_hicache_transfer_time_per_token = 0.05
         cache.qos_hicache_cost_ewma_alpha = 0.2
+        cache.qos_hicache_max_eviction_steps = 64
         cache.ongoing_load_back_stats = {}
         cache.pending_host_source_releases = set()
         cache.page_size = 1
@@ -89,6 +90,60 @@ class TestQoSHiCacheAdmission(unittest.TestCase):
         node.hit_count = 1
 
         self.assertFalse(cache._prepare_selective_host_space(node))
+
+    def test_host_victim_budget_failure_is_atomic(self):
+        cache = self._cache()
+        cache.root_node = TreeNode()
+        cache.evictable_host_leaves = set()
+        cache._record_remove_event = MagicMock()
+        cache._update_host_leaf_status = MagicMock()
+        cache.cache_controller.evict_host.side_effect = len
+        for token, priority in ((1, 1), (2, 2)):
+            node = TreeNode(priority=priority)
+            node.key = RadixKey([token] * 4)
+            node.value = None
+            node.host_value = torch.tensor([token] * 4)
+            node.parent = cache.root_node
+            cache.root_node.children[
+                node.key.child_key(cache.page_size)
+            ] = node
+            cache.evictable_host_leaves.add(node)
+        cache.qos_hicache_max_eviction_steps = 1
+
+        evicted = cache.evict_host(
+            8, max_priority=10, priority_fn=lambda node: node.priority
+        )
+
+        self.assertEqual(evicted, 0)
+        self.assertEqual(len(cache.root_node.children), 2)
+        cache.cache_controller.evict_host.assert_not_called()
+
+    def test_host_victims_commit_after_sufficient_preselection(self):
+        cache = self._cache()
+        cache.root_node = TreeNode()
+        cache.evictable_host_leaves = set()
+        cache._record_remove_event = MagicMock()
+        cache._update_host_leaf_status = MagicMock()
+        cache.cache_controller.evict_host.side_effect = len
+        for token, priority in ((1, 1), (2, 2)):
+            node = TreeNode(priority=priority)
+            node.key = RadixKey([token] * 4)
+            node.value = None
+            node.host_value = torch.tensor([token] * 4)
+            node.parent = cache.root_node
+            cache.root_node.children[
+                node.key.child_key(cache.page_size)
+            ] = node
+            cache.evictable_host_leaves.add(node)
+        cache.qos_hicache_max_eviction_steps = 2
+
+        evicted = cache.evict_host(
+            8, max_priority=10, priority_fn=lambda node: node.priority
+        )
+
+        self.assertEqual(evicted, 8)
+        self.assertEqual(len(cache.root_node.children), 0)
+        self.assertEqual(cache.cache_controller.evict_host.call_count, 2)
 
     def test_rejects_zero_benefit_even_when_host_has_space(self):
         cache = self._cache()

@@ -727,6 +727,10 @@ class ServerArgs:
         float,
         "Estimated prefill recomputation time per token in seconds for QoS-aware HiCache admission.",
     ] = 1e-4
+    qos_hicache_max_eviction_steps: A[
+        int,
+        "Maximum victim-selection steps per QoS-aware HiCache eviction operation.",
+    ] = 64
     disable_priority_preemption: A[bool, "Disable priority scheduling preemption."] = (
         False
     )
@@ -6964,6 +6968,9 @@ class ServerArgs:
         if self.enable_qos_aware_prefix_cache:
             assert self.qos_hicache_recompute_time_per_token > 0, (
                 "--qos-hicache-recompute-time-per-token must be positive"
+            )
+            assert self.qos_hicache_max_eviction_steps > 0, (
+                "--qos-hicache-max-eviction-steps must be positive"
             )
         else:
             assert self.schedule_policy != "qos-lpm", (
