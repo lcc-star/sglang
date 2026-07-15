@@ -218,7 +218,10 @@ class HiRadixCache(RadixCache):
         )
         self.qos_hicache_write_time_per_token = 0.0
         self.qos_hicache_cost_ewma_alpha = 0.2
-        self.qos_hicache_auto_calibrate = server_args.qos_hicache_auto_calibrate
+        self.qos_hicache_auto_calibrate = (
+            server_args.qos_hicache_auto_calibrate
+            and not server_args.disable_qos_hicache_auto_calibrate
+        )
         self.qos_hicache_recompute_calibration_samples = 0
         self.qos_hicache_max_eviction_steps = (
             server_args.qos_hicache_max_eviction_steps

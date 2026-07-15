@@ -731,6 +731,10 @@ class ServerArgs:
         bool,
         "Calibrate QoS-aware HiCache transfer costs at startup and recomputation costs from initial real prefill batches.",
     ] = True
+    disable_qos_hicache_auto_calibrate: A[
+        bool,
+        "Disable QoS-aware HiCache hardware calibration for static-cost ablation experiments.",
+    ] = False
     qos_hicache_max_eviction_steps: A[
         int,
         "Maximum victim-selection steps per QoS-aware HiCache eviction operation.",
