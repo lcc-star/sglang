@@ -3220,10 +3220,17 @@ class Scheduler(
                 self.tree_cache, "qos_hicache_recompute_calibration_samples", 3
             ) < 3
         ):
-            num_tokens = sum(
-                req.extend_range.length
-                for req in batch.reqs
-                if req.extend_range is not None
+            # Compare against H2D latency on a request's critical path, not
+            # aggregate batch throughput. All requests in the batch execute in
+            # the same forward pass, so the longest extend is the appropriate
+            # token denominator for the observed wall-clock duration.
+            num_tokens = max(
+                (
+                    req.extend_range.length
+                    for req in batch.reqs
+                    if req.extend_range is not None
+                ),
+                default=0,
             )
             if num_tokens >= getattr(
                 self.tree_cache, "qos_hicache_recompute_calibration_min_tokens", 256

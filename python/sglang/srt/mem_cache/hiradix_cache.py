@@ -972,17 +972,20 @@ class HiRadixCache(RadixCache):
             if node.host_load_count > 0
             else self.qos_hicache_transfer_time_per_token
         )
+        demand = node.hit_count + node.host_match_count
+        # D2H is paid once when the prefix is admitted; H2D is paid on each
+        # future reuse. Amortizing the write cost lets repeatedly reused
+        # prefixes remain valuable without admitting cold prefixes.
         net_benefit = max(
-            self.qos_hicache_recompute_time_per_token
-            - transfer_time
+            demand
+            * (self.qos_hicache_recompute_time_per_token - transfer_time)
             - self.qos_hicache_write_time_per_token,
             0.0,
         )
-        demand = node.hit_count + node.host_match_count
         qos_weight = get_qos_weight(
             node.priority, self.schedule_low_priority_values_first
         )
-        return (demand * net_benefit * qos_weight, node.last_access_time)
+        return (net_benefit * qos_weight, node.last_access_time)
 
     def _should_load_back(self, nodes: list[TreeNode]) -> bool:
         recompute_time = sum(

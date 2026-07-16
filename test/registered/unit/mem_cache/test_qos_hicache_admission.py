@@ -209,6 +209,16 @@ class TestQoSHiCacheAdmission(unittest.TestCase):
 
         self.assertAlmostEqual(value, 5 * (0.1 - 0.02) * 3)
 
+    def test_host_value_amortizes_write_cost_across_reuses(self):
+        cache = self._cache()
+        cache.qos_hicache_write_time_per_token = 0.1
+        node = self._node(priority=2)
+        node.hit_count = 4
+
+        value, _ = cache._get_host_admission_priority(node)
+
+        self.assertAlmostEqual(value, (4 * (0.1 - 0.05) - 0.1) * 2)
+
     def test_host_value_is_zero_when_transfer_is_slower(self):
         cache = self._cache()
         node = self._node(priority=3)
