@@ -3224,14 +3224,12 @@ class Scheduler(
             # aggregate batch throughput. All requests in the batch execute in
             # the same forward pass, so the longest extend is the appropriate
             # token denominator for the observed wall-clock duration.
-            num_tokens = max(
-                (
-                    req.extend_range.length
-                    for req in batch.reqs
-                    if req.extend_range is not None
-                ),
-                default=0,
-            )
+            extend_lengths = [
+                req.extend_range.length
+                for req in batch.reqs
+                if req.extend_range is not None
+            ]
+            num_tokens = max(extend_lengths) if len(extend_lengths) >= 2 else 0
             if num_tokens >= getattr(
                 self.tree_cache, "qos_hicache_recompute_calibration_min_tokens", 256
             ):
